@@ -3,6 +3,7 @@ import fitz  # PyMuPDF para leer PDFs gigantes rápido
 import pandas as pd
 import re
 import json
+import time
 import unicodedata
 from io import BytesIO
 from rapidfuzz import fuzz
@@ -86,15 +87,37 @@ def extraer_bloques_bibliografia(archivo_pdf):
 
     return bloques
 
+def obtener_modelos_candidatos(client):
+    """Busca automáticamente qué modelos Flash están disponibles en la cuenta del usuario."""
+    candidatos = [
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-2.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-2.0-flash"
+    ]
+    try:
+        for m in client.models.list():
+            nombre = m.name.replace("models/", "")
+            if "gemini" in nombre.lower() and "flash" in nombre.lower() and "2.5-flash" not in nombre.lower():
+                if nombre not in candidatos:
+                    candidatos.insert(0, nombre)
+    except Exception:
+        pass
+    return candidatos
+
 def analizar_con_ia(bloques, clave_api):
     """Envía los bloques de bibliografía a Gemini para separar Título, Autor, Editorial, Año y Edición."""
     client = genai.Client(api_key=clave_api)
+    modelos_disponibles = obtener_modelos_candidatos(client)
+    modelo_activo = None
     libros_extraidos = []
 
+    # Paquetes grandes (30,000 caracteres) para hacer menos llamadas y terminar más rápido
     lotes = []
     lote_actual = ""
     for b in bloques:
-        if len(lote_actual) + len(b) < 10000:
+        if len(lote_actual) + len(b) < 30000:
             lote_actual += "\n---\n" + b
         else:
             lotes.append(lote_actual)
@@ -117,17 +140,35 @@ def analizar_con_ia(bloques, clave_api):
         Texto a analizar:
         {lote}
         """
-        try:
-            respuesta = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-            datos = json.loads(respuesta.text)
-            if isinstance(datos, list):
-                libros_extraidos.extend(datos)
-        except Exception as e:
-            st.warning(f"Aviso en bloque {idx + 1}: {e}")
+        exito = False
+        lista_a_probar = [modelo_activo] if modelo_activo else modelos_disponibles
+
+        for mod in lista_a_probar:
+            for intento in range(2):
+                try:
+                    respuesta = client.models.generate_content(
+                        model=mod,
+                        contents=prompt,
+                        config={"response_mime_type": "application/json"}
+                    )
+                    datos = json.loads(respuesta.text)
+                    if isinstance(datos, list):
+                        libros_extraidos.extend(datos)
+                    modelo_activo = mod
+                    exito = True
+                    break
+                except Exception as e:
+                    msg_error = str(e)
+                    # Si Google pide esperar unos segundos por límite gratuito, esperamos y reintentamos
+                    if "429" in msg_error or "RESOURCE_EXHAUSTED" in msg_error:
+                        time.sleep(6)
+                        continue
+                    break
+            if exito:
+                break
+
+        if not exito:
+            st.warning(f"No se pudo procesar el bloque {idx + 1}. Verifica tu API Key.")
 
         barra.progress((idx + 1) / len(lotes), text=f"Procesando bloque {idx + 1} de {len(lotes)}...")
 
